@@ -1,0 +1,289 @@
+import { ExtractionResult } from '../types';
+import { detectPeriodFromFilename } from './taxCalculations';
+import {
+  cleanNumericToken,
+  parseVenAmount,
+  normalizePdfText,
+  extractCasillaAmount,
+  extractTextFromPdfInBrowser,
+} from './pdfExtractor';
+
+export {
+  cleanNumericToken,
+  parseVenAmount,
+  normalizePdfText,
+  extractCasillaAmount,
+  extractTextFromPdfInBrowser,
+};
+
+// Extract amounts from sliding text window
+function extractAmountsFromWindow(text: string, excludedNumbers: number[] = []): number[] {
+  let sanitized = text.replace(/(?:^|\n|\r|\s)\d{1,2}\.\s+/g, ' ');
+  sanitized = sanitized.replace(/\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b/g, ' ');
+  sanitized = sanitized.replace(/\b(?:del|desde)?\s*\d{1,2}\s*(?:al|a|hasta|-)\s*\d{1,2}\b/gi, ' ');
+  sanitized = sanitized.replace(/\b\d+(?:[\.,]\d+)?\s*%/g, ' ');
+  sanitized = sanitized.replace(/\b20[2-3][0-9]\b/g, ' ');
+  sanitized = sanitized.replace(/\b([0-9]{1,2})\b(?!\s*,\s*\d{2}|\s*\.\s*\d{2})/g, ' ');
+
+  const tokenRegex = /(?:\b\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?\b|\b\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?\b|\b\d+[,\.]\d{1,2}\b|\b\d{4,}\b)/g;
+  const matches = sanitized.match(tokenRegex) || [];
+  const amounts: number[] = [];
+
+  const commonItemCodes = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    28, 30, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    53, 54, 60, 66, 67, 70, 71, 90, 442, 443, 333, 343
+  ];
+
+  for (const m of matches) {
+    const parsed = parseVenAmount(m);
+    if (excludedNumbers.includes(parsed)) continue;
+    if (parsed > 500000000) continue;
+    if (!m.includes(',') && !m.includes('.') && (commonItemCodes.includes(parsed) || parsed < 100)) continue;
+    if (parsed === 10 || parsed === 15) {
+      if (!m.includes(',00') && !m.includes('.00')) continue;
+    }
+    amounts.push(parsed);
+  }
+
+  return amounts;
+}
+
+// SENIAT Forma 30 deterministic parser (Client-Side)
+export function parseSeniatForma30(
+  rawText: string,
+  fileName: string,
+  preferredPeriod?: { year?: number; month?: number; quincena?: 1 | 2 }
+): NonNullable<ExtractionResult['data']> {
+  const normText = normalizePdfText(rawText);
+  const lines = normText.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+
+  // 1. RIF Extraction
+  let rif = 'J-00000000-0';
+  const rifMatch = normText.match(/(?:RIF|R\.I\.F\.?|NÚMERO DE RIF|NUMERO DE RIF)[\s:]*([VJEGP]-?\d{7,9}-?\d?)/i) ||
+                   normText.match(/\b([VJEGP]-?\d{7,9}-?\d?)\b/i);
+  if (rifMatch) {
+    let r = rifMatch[1].toUpperCase().replace(/\s+/g, '');
+    if (!r.includes('-') && r.length >= 8) {
+      r = `${r[0]}-${r.slice(1)}`;
+    }
+    rif = r;
+  }
+
+  // 2. Razón Social Extraction
+  let razonSocial = '';
+  const razonSocialMatch = normText.match(/(?:Razón Social|Nombre o Razón Social|Contribuyente|NOMBRE O RAZÓN SOCIAL|NOMBRE O RAZON SOCIAL)[\s:]+([^\n\r]+)/i) ||
+                           normText.match(/(?:APELLIDOS Y NOMBRES O RAZÓN SOCIAL)[\s:]+([^\n\r]+)/i);
+  if (razonSocialMatch) {
+    const rawName = razonSocialMatch[1].trim().replace(/^[:\-\s]+/, '').split(/\s{3,}|\t/)[0];
+    if (rawName && rawName.length > 2) {
+      razonSocial = rawName.toUpperCase();
+    }
+  }
+
+  // 3. Fechas y Período de Imposición (SENIAT Forma 99030 / Forma 30)
+  let fechaDeclaracion = '';
+  let fechaDesde = '';
+  let fechaHasta = '';
+  let pdfTextMonth: number | undefined;
+  let pdfTextYear: number | undefined;
+  let pdfTextQuincena: 1 | 2 | undefined;
+
+  const fechaDeclMatch = normText.match(/(?:Fecha de Declaración|FECHA DE DECLARACION|Fecha de Presentación|FECHA DE PRESENTACION|FECHA PRESENTACION|FECHA DECLARACIÓN|FECHA)[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
+  if (fechaDeclMatch) fechaDeclaracion = fechaDeclMatch[1];
+
+  // SENIAT Forma 99030 Header Box: "PERIODO DE IMPOSICION MES 04 AÑO 2026" or "MES 04 AÑO 2026"
+  const mesAnoMatch = normText.match(/(?:PERIODO DE IMPOSICION|PERIODO|PERÍODO)?[\s\S]{0,50}MES[\s:]*(0?[1-9]|1[0-2])[\s\S]{0,30}AÑO[\s:]*(202[0-9]|203[0-9])/i) ||
+                      normText.match(/\bMES[:\s]*(0?[1-9]|1[0-2])\b[\s\S]{0,40}\bAÑO[:\s]*(202[0-9]|203[0-9])\b/i);
+  if (mesAnoMatch) {
+    pdfTextMonth = parseInt(mesAnoMatch[1], 10);
+    pdfTextYear = parseInt(mesAnoMatch[2], 10);
+  }
+
+  const periodoMatch = normText.match(/(?:PERIODO|PERÍODO)\s*(?:IMPOSITIVO)?[\s\S]{0,120}?DESDE[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})[\s\S]{0,60}?HASTA[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
+  const rangeMatch = normText.match(/\b(0?[1-9]|[12][0-9]|3[01])[\/\-\.](0?[1-9]|1[0-2])[\/\-\.](202[0-9])\s*(?:AL|A|HASTA|-)\s*(0?[1-9]|[12][0-9]|3[01])[\/\-\.](0?[1-9]|1[0-2])[\/\-\.](202[0-9])\b/i);
+
+  if (periodoMatch) {
+    fechaDesde = periodoMatch[1];
+    fechaHasta = periodoMatch[2];
+  } else if (rangeMatch) {
+    fechaDesde = `${rangeMatch[1]}/${rangeMatch[2]}/${rangeMatch[3]}`;
+    fechaHasta = `${rangeMatch[4]}/${rangeMatch[5]}/${rangeMatch[6]}`;
+  }
+
+  if (fechaDesde) {
+    const parts = fechaDesde.split(/[\/\-\.]/);
+    if (parts.length === 3) {
+      const day = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10);
+      let y = parseInt(parts[2], 10);
+      if (y < 100) y += 2000;
+      if (!pdfTextYear && y >= 2020) pdfTextYear = y;
+      if (!pdfTextMonth && m >= 1 && m <= 12) pdfTextMonth = m;
+      pdfTextQuincena = day > 15 ? 2 : 1;
+    }
+  }
+
+  // 4. Period Resolution (Strict Rule 1: Filename cues > PDF Text Cues > Preferred Selection > Defaults)
+  const filenameCues = detectPeriodFromFilename(fileName);
+
+  const detectedQuincena: 1 | 2 = filenameCues.quincena ?? pdfTextQuincena ?? preferredPeriod?.quincena ?? 1;
+  const detectedMonth = filenameCues.month ?? pdfTextMonth ?? preferredPeriod?.month ?? 1;
+  const detectedYear = filenameCues.year ?? pdfTextYear ?? preferredPeriod?.year ?? new Date().getFullYear();
+
+  // 5. Declaración & Certificado numbers
+  let numeroDeclaracion = '';
+  let numeroCertificado = '';
+  const declNumMatch = normText.match(/(?:Número de Declaración|NUMERO DE DECLARACION|N° de Declaración|Nro\. Declaración|Declaración No\.)[\s:]*([A-Z0-9\-]+)/i);
+  const certNumMatch = normText.match(/(?:Número de Certificado|NUMERO DE CERTIFICADO|N° Certificado|Certificado Electrónico No\.|Certificado No\.)[\s:]*([A-Z0-9\-]+)/i) ||
+                       normText.match(/(?:Certificado|No\. Certificado)[\s:]*(\d{8,12})/i);
+  if (declNumMatch) numeroDeclaracion = declNumMatch[1];
+  if (certNumMatch) numeroCertificado = certNumMatch[1];
+
+  // 6. Direct Casilla Extraction
+  const item40 = extractCasillaAmount(normText, 40) ?? 0;
+  const item41 = extractCasillaAmount(normText, 41) ?? 0;
+  let item42 = extractCasillaAmount(normText, 42) ?? 0;
+  let item43 = extractCasillaAmount(normText, 43) ?? 0;
+  const item442 = extractCasillaAmount(normText, 442) ?? extractCasillaAmount(normText, 44) ?? 0;
+  const item443 = extractCasillaAmount(normText, 443) ?? 0;
+  let item47 = extractCasillaAmount(normText, 47) ?? 0;
+
+  const item30 = extractCasillaAmount(normText, 30) ?? 0;
+  const item31 = extractCasillaAmount(normText, 31) ?? 0;
+  let item33 = extractCasillaAmount(normText, 33) ?? 0;
+  let item34 = extractCasillaAmount(normText, 34) ?? 0;
+  const item333 = extractCasillaAmount(normText, 333) ?? 0;
+  const item343 = extractCasillaAmount(normText, 343) ?? 0;
+  let item35 = extractCasillaAmount(normText, 35) ?? 0;
+  const item70 = extractCasillaAmount(normText, 70) ?? 0;
+  const item37 = extractCasillaAmount(normText, 37) ?? 0;
+  let item71 = extractCasillaAmount(normText, 71) ?? 0;
+
+  const item20 = extractCasillaAmount(normText, 20) ?? 0;
+  const item38 = extractCasillaAmount(normText, 38) ?? 0;
+  const item39 = extractCasillaAmount(normText, 39) ?? 0;
+  let item53 = extractCasillaAmount(normText, 53) ?? 0;
+  let item60 = extractCasillaAmount(normText, 60) ?? 0;
+
+  const item54 = extractCasillaAmount(normText, 54) ?? 0;
+  const item66 = extractCasillaAmount(normText, 66) ?? 0;
+  const item67 = extractCasillaAmount(normText, 67) ?? 0;
+  const item90 = extractCasillaAmount(normText, 90) ?? 0;
+
+  // Window scanner fallbacks for critical totals if 0
+  if (item42 === 0 || item43 === 0) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/Ventas Gravadas|Alícuota General/i.test(lines[i])) {
+        const window = lines.slice(i, i + 3).join(' ');
+        const ams = extractAmountsFromWindow(window, [42, 43, 16]);
+        if (ams.length >= 2) {
+          if (item42 === 0) item42 = ams[0];
+          if (item43 === 0) item43 = ams[1];
+        } else if (ams.length === 1 && item42 === 0) {
+          item42 = ams[0];
+          if (item43 === 0) item43 = Math.round(ams[0] * 0.16 * 100) / 100;
+        }
+        break;
+      }
+    }
+  }
+
+  if (item33 === 0 || item34 === 0) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/Compras Gravadas|Alícuota General/i.test(lines[i])) {
+        const window = lines.slice(i, i + 3).join(' ');
+        const ams = extractAmountsFromWindow(window, [33, 34, 16]);
+        if (ams.length >= 2) {
+          if (item33 === 0) item33 = ams[0];
+          if (item34 === 0) item34 = ams[1];
+        } else if (ams.length === 1 && item33 === 0) {
+          item33 = ams[0];
+          if (item34 === 0) item34 = Math.round(ams[0] * 0.16 * 100) / 100;
+        }
+        break;
+      }
+    }
+  }
+
+  // Auto-calculated cross totals
+  if (item47 === 0 && (item43 > 0 || item443 > 0)) {
+    item47 = Math.round((item43 + item443) * 100) / 100;
+  }
+  if (item34 === 0 && item33 > 0) {
+    item34 = Math.round(item33 * 0.16 * 100) / 100;
+  }
+  if (item35 === 0 && (item30 > 0 || item33 > 0 || item333 > 0)) {
+    item35 = Math.round((item30 + item33 + item333 + item31) * 100) / 100;
+  }
+  if (item71 === 0) {
+    item71 = item70 > 0 ? item70 : Math.round((item34 + item343) * 100) / 100;
+  }
+
+  // Calculate Cuota Tributaria (item 53) or Excedente Siguiente (item 60)
+  const totalCreditos = Math.round((item71 + item20 + item38) * 100) / 100;
+  if (item53 === 0 && item60 === 0 && (item47 > 0 || totalCreditos > 0)) {
+    if (item47 > totalCreditos) {
+      item53 = Math.round((item47 - totalCreditos) * 100) / 100;
+    } else {
+      item60 = Math.round((totalCreditos - item47) * 100) / 100;
+    }
+  }
+
+  // Anti-contamination sanitizer: zero out any values that accidentally captured the casilla item code itself
+  const sanitizeValue = (val: number, itemCode: number): number => {
+    if (val === itemCode) return 0;
+    return val;
+  };
+
+  return {
+    razonSocial: razonSocial || 'EMPRESA CONTRIBUYENTE',
+    rif: rif || 'J-00000000-0',
+    fiscalYear: detectedYear,
+    month: detectedMonth,
+    quincena: detectedQuincena,
+    fechaDesde,
+    fechaHasta,
+    numeroDeclaracion,
+    numeroCertificado,
+    fechaDeclaracion,
+    fileName,
+    item40: sanitizeValue(item40, 40),
+    item41: sanitizeValue(item41, 41),
+    item42: sanitizeValue(item42, 42),
+    item43: sanitizeValue(item43, 43),
+    item442: sanitizeValue(item442, 442),
+    item443: sanitizeValue(item443, 443),
+    ingresoIntereses: 0,
+    item47: sanitizeValue(item47, 47),
+    item30: sanitizeValue(item30, 30),
+    item31: sanitizeValue(item31, 31),
+    item33: sanitizeValue(item33, 33),
+    item34: sanitizeValue(item34, 34),
+    item333: sanitizeValue(item333, 333),
+    item343: sanitizeValue(item343, 343),
+    item35: sanitizeValue(item35, 35),
+    item70: sanitizeValue(item70, 70),
+    item37: sanitizeValue(item37, 37),
+    item71: sanitizeValue(item71, 71),
+    item20: sanitizeValue(item20, 20),
+    item38: sanitizeValue(item38, 38),
+    item39: sanitizeValue(totalCreditos, 39),
+    item53: sanitizeValue(item53, 53),
+    item60: sanitizeValue(item60, 60),
+    item54: sanitizeValue(item54, 54),
+    item66: sanitizeValue(item66, 66),
+    item67: sanitizeValue(item67, 67),
+    item90: sanitizeValue(item90, 90),
+    extractedAt: new Date().toISOString(),
+  };
+}
+
+// Main Client-Side PDF Extraction Workflow
+export async function extractIvaFromPdfClient(
+  file: File,
+  preferredPeriod?: { year?: number; month?: number; quincena?: 1 | 2 }
+): Promise<NonNullable<ExtractionResult['data']>> {
+  const text = await extractTextFromPdfInBrowser(file);
+  return parseSeniatForma30(text, file.name, preferredPeriod);
+}
